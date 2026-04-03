@@ -9,12 +9,16 @@ A tiny TUI that hits an HTTP endpoint and shows you everything — status, timin
 ## Install
 
 ```
+brew install kaxing/toolbox/zur
+```
+
+Or build from source (requires [Zig](https://ziglang.org/) 0.15.2+):
+
+```
 make install
 ```
 
 Installs to `~/bin`. Override with `PREFIX=/usr/local/bin make install`.
-
-Requires [Zig](https://ziglang.org/) 0.15.2+.
 
 ## Usage
 
