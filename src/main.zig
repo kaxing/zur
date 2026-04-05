@@ -1,6 +1,7 @@
 const std = @import("std");
 const curl = @import("curl");
 const posix = std.posix;
+const traceroute = @import("traceroute.zig");
 
 const Curl = curl.libcurl;
 
@@ -152,6 +153,101 @@ const Stats = struct {
     download: Sampler = .{},
 };
 
+// ── Traceroute state (background thread) ─────────────────────────────
+const TraceState = struct {
+    mutex: std.Thread.Mutex = .{},
+    output: std.ArrayListUnmanaged(u8) = .empty,
+    line_count: usize = 0,
+    done: bool = false,
+    failed: bool = false,
+    alloc: std.mem.Allocator,
+
+    fn init(alloc: std.mem.Allocator) TraceState {
+        return .{ .alloc = alloc };
+    }
+
+    fn deinit(self: *TraceState) void {
+        self.output.deinit(self.alloc);
+    }
+
+    fn getData(self: *TraceState) struct { text: []const u8, lines: usize, done: bool, failed: bool } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{ .text = self.output.items, .lines = self.line_count, .done = self.done, .failed = self.failed };
+    }
+};
+
+fn traceThreadFn(state: *TraceState, ip_str: [:0]const u8, port: u16) void {
+    if (traceroute.backend == .tcp_syn) {
+        traceWithTcpSyn(state, ip_str, port);
+    } else {
+        traceWithSystem(state, ip_str);
+    }
+}
+
+fn traceWithTcpSyn(state: *TraceState, ip_str: [:0]const u8, port: u16) void {
+    const tracer = traceroute.Tracer.init(ip_str, port) catch {
+        state.mutex.lock();
+        state.failed = true;
+        state.done = true;
+        state.mutex.unlock();
+        return;
+    };
+
+    const max_hops: u8 = 30;
+    var hop_buf: [128]u8 = undefined;
+    var ttl: u8 = 1;
+    while (ttl <= max_hops) : (ttl += 1) {
+        const hop = tracer.probe(ttl, 2000); // 2s timeout per hop
+        const line = traceroute.fmtHop(&hop_buf, hop);
+
+        state.mutex.lock();
+        state.output.appendSlice(state.alloc, line) catch {};
+        state.output.append(state.alloc, '\n') catch {};
+        state.line_count += 1;
+        state.mutex.unlock();
+
+        if (hop.reached) break;
+    }
+
+    state.mutex.lock();
+    state.done = true;
+    state.mutex.unlock();
+}
+
+fn traceWithSystem(state: *TraceState, ip_str: [:0]const u8) void {
+    const argv = [_][]const u8{ "traceroute", "-m", "30", "-w", "2", ip_str };
+    var child = std.process.Child.init(&argv, state.alloc);
+    child.stdout_behavior = .pipe;
+    child.stderr_behavior = .pipe;
+
+    child.spawn() catch {
+        state.mutex.lock();
+        state.failed = true;
+        state.done = true;
+        state.mutex.unlock();
+        return;
+    };
+
+    // Stream stdout line by line for live updates
+    const stdout = child.stdout.?;
+    var line_buf: [256]u8 = undefined;
+    while (true) {
+        const line = stdout.reader().readUntilDelimiter(&line_buf, '\n') catch break;
+        state.mutex.lock();
+        state.output.appendSlice(state.alloc, line) catch {};
+        state.output.append(state.alloc, '\n') catch {};
+        state.line_count += 1;
+        state.mutex.unlock();
+    }
+
+    _ = child.wait() catch {};
+
+    state.mutex.lock();
+    state.done = true;
+    state.mutex.unlock();
+}
+
 // ── Format buffers ───────────────────────────────────────────────────
 const FmtBufs = struct {
     status: [64]u8 = undefined,
@@ -172,6 +268,7 @@ const FmtBufs = struct {
     total_st: [128]u8 = undefined,
     err_prev: [96]u8 = undefined,
     body_val: [64]u8 = undefined,
+    trace_val: [64]u8 = undefined,
 };
 
 // ── Row ──────────────────────────────────────────────────────────────
@@ -180,6 +277,7 @@ const Row = struct {
     value: []const u8,
     detail: ?[]const u8 = null,
     body_ref: ?*const BodyAccum = null, // for Body row: full content
+    trace_ref: ?*TraceState = null, // for Traceroute row
     bar_frac: ?f64 = null,
     follow_url: ?[:0]const u8 = null,
 };
@@ -201,8 +299,8 @@ const RawTerm = struct {
         t.lflag.ECHO = false;
         t.lflag.ICANON = false;
         t.lflag.ISIG = false;
-        t.cc[@intFromEnum(posix.V.MIN)] = 1;
-        t.cc[@intFromEnum(posix.V.TIME)] = 0;
+        t.cc[@intFromEnum(posix.V.MIN)] = 0;
+        t.cc[@intFromEnum(posix.V.TIME)] = 2; // 200ms timeout for live updates
         try posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, t);
         return .{ .orig = orig };
     }
@@ -593,6 +691,28 @@ pub fn main() !void {
 
     if (quiet) std.process.exit(if (status >= 200 and status < 400) 0 else 1);
 
+    // ── Spawn background traceroute ──────────────────────────────────
+    var trace_state = TraceState.init(allocator);
+    defer trace_state.deinit();
+
+    // Use resolved IP from curl (avoids DNS in traceroute)
+    const trace_ip = getStr(handle, Curl.CURLINFO_PRIMARY_IP);
+    const trace_ip_z: ?[:0]const u8 = if (trace_ip) |ip| allocator.dupeZ(u8, ip) catch null else null;
+    defer if (trace_ip_z) |z| allocator.free(z);
+
+    // Port from URL scheme
+    const trace_port: u16 = if (std.mem.startsWith(u8, target_url, "https")) 443 else 80;
+
+    var trace_thread: ?std.Thread = null;
+    if (trace_ip_z) |ip_z| {
+        trace_thread = std.Thread.spawn(.{}, traceThreadFn, .{ &trace_state, ip_z, trace_port }) catch null;
+    }
+    defer if (trace_thread) |t| t.join();
+
+    // Append trace row
+    const trace_label = if (traceroute.backend == .tcp_syn) "Traceroute" else "Traceroute*";
+    try rows.append(allocator, .{ .label = trace_label, .value = "starting\xe2\x80\xa6", .trace_ref = &trace_state });
+
     // ── Non-interactive output ────────────────────────────────────────
     const is_tty = posix.isatty(posix.STDOUT_FILENO) and posix.isatty(posix.STDIN_FILENO);
 
@@ -631,6 +751,19 @@ pub fn main() !void {
     var show_detail = false;
 
     while (true) {
+        // Update trace row value
+        for (rows.items) |*row| {
+            if (row.trace_ref) |ts| {
+                const td = ts.getData();
+                row.value = if (td.failed)
+                    "\xe2\x9c\x97 trace failed"
+                else if (td.done)
+                    std.fmt.bufPrint(&bufs.trace_val, "\xe2\x9c\x93 {d} hops  \xe2\x8f\x8e view", .{td.lines}) catch "done"
+                else
+                    std.fmt.bufPrint(&bufs.trace_val, "tracing\xe2\x80\xa6 {d} hops", .{td.lines}) catch "tracing\xe2\x80\xa6";
+            }
+        }
+
         // Clear and draw
         try out.writeAll(esc.hide_cursor ++ esc.clear);
 
@@ -706,7 +839,7 @@ pub fn main() !void {
         // Read key
         var read_buf: [8]u8 = undefined;
         const n = posix.read(posix.STDIN_FILENO, &read_buf) catch break;
-        if (n == 0) break;
+        if (n == 0) continue; // timeout — redraw for live trace updates
 
         const key = read_buf[0..n];
         if (key.len == 1) {
@@ -741,6 +874,11 @@ pub fn main() !void {
                         try bodyViewer(out, bref, target_url, content_type_str);
                         continue; // redraw overview
                     }
+                    // Full-screen trace viewer
+                    if (rows.items[cursor].trace_ref) |tref| {
+                        try traceViewer(out, tref, target_url);
+                        continue;
+                    }
                     show_detail = !show_detail;
                 },
                 'r', 'R' => {
@@ -751,6 +889,8 @@ pub fn main() !void {
                     status = r.status;
                     failed = r.failed;
                     content_type_str = getStr(handle, Curl.CURLINFO_CONTENT_TYPE) orelse "";
+                    // Re-append trace row (doFetch clears rows)
+                    rows.append(allocator, .{ .label = trace_label, .value = "…", .trace_ref = &trace_state }) catch {};
                     show_detail = false;
                     // Keep cursor in bounds
                     if (cursor >= rows.items.len and rows.items.len > 0) cursor = rows.items.len - 1;
@@ -868,6 +1008,109 @@ fn bodyViewer(out: *std.Io.Writer, bref: *const BodyAccum, url: []const u8, ctyp
                 'B' => scroll += 1,
                 '5' => scroll -|= view_h, // Page Up
                 '6' => scroll +|= view_h, // Page Down
+                else => {},
+            }
+        }
+
+        // Clamp scroll
+        if (total_lines > view_h) {
+            if (scroll > total_lines - view_h) scroll = total_lines - view_h;
+        } else {
+            scroll = 0;
+        }
+    }
+}
+
+fn traceViewer(out: *std.Io.Writer, ts: *TraceState, url: []const u8) !void {
+    var scroll: usize = 0;
+
+    while (true) {
+        const td = ts.getData();
+        const trace_data = td.text;
+        const total_lines = if (td.lines == 0 and trace_data.len > 0) @as(usize, 1) else td.lines;
+        const term = getTermSize();
+        const view_h: usize = @as(usize, term.rows) -| 3;
+        const view_w: usize = @as(usize, term.cols) -| 2;
+
+        try out.writeAll(esc.hide_cursor ++ esc.clear);
+
+        // Header
+        try out.writeAll(esc.bold ++ " Traceroute" ++ esc.reset ++
+            if (traceroute.backend == .tcp_syn) esc.dim ++ " (tcp-syn)" ++ esc.reset ++ "  " else esc.dim ++ " (system)" ++ esc.reset ++ "  ");
+        try out.writeAll(esc.dim);
+        try out.writeAll(url);
+        if (!td.done) {
+            try out.writeAll(esc.reset ++ "  " ++ esc.yellow ++ "tracing\xe2\x80\xa6" ++ esc.reset);
+        }
+        try out.writeAll(esc.reset ++ "\n");
+
+        // Separator
+        try out.writeAll(esc.dim);
+        var sep_i: usize = 0;
+        while (sep_i < @min(view_w + 1, 60)) : (sep_i += 1) try out.writeAll("\xe2\x94\x80");
+        try out.writeAll(esc.reset ++ "\n");
+
+        // Trace lines
+        if (trace_data.len == 0) {
+            if (td.failed) {
+                try out.writeAll(esc.red ++ " traceroute failed — could not create socket" ++ esc.reset ++ "\n");
+            } else {
+                try out.writeAll(esc.dim ++ " waiting for first hop…" ++ esc.reset ++ "\n");
+            }
+        } else {
+            var line_start: usize = 0;
+            var line_num: usize = 0;
+            var displayed: usize = 0;
+            while (line_start <= trace_data.len and displayed < view_h) {
+                if (line_start == trace_data.len) break;
+                const nl = std.mem.indexOfScalarPos(u8, trace_data, line_start, '\n') orelse trace_data.len;
+                if (line_num >= scroll) {
+                    const line_end = @min(nl, line_start + view_w);
+                    try out.writeAll(" ");
+                    try out.writeAll(trace_data[line_start..line_end]);
+                    try out.writeByte('\n');
+                    displayed += 1;
+                }
+                line_start = nl + 1;
+                line_num += 1;
+            }
+        }
+
+        // Footer
+        try out.writeAll(esc.dim);
+        try out.print("\n {d} hops  ", .{total_lines});
+        if (td.done) try out.writeAll("complete  ") else try out.writeAll("in progress  ");
+        try out.writeAll("\xe2\x86\x91\xe2\x86\x93/j/k scroll  q/Esc back");
+        try out.writeAll(esc.reset);
+
+        try out.flush();
+
+        // Key input
+        var read_buf: [8]u8 = undefined;
+        const n = posix.read(posix.STDIN_FILENO, &read_buf) catch return;
+        if (n == 0) continue; // timeout — refresh for live updates
+
+        const key = read_buf[0..n];
+        if (key.len == 1) {
+            switch (key[0]) {
+                'q', 27 => return,
+                'j', 'J' => scroll += 1,
+                'k', 'K' => {
+                    if (scroll > 0) scroll -= 1;
+                },
+                ' ' => scroll +|= view_h,
+                'g' => scroll = 0,
+                'G' => scroll = total_lines -| view_h,
+                else => {},
+            }
+        } else if (key.len >= 3 and key[0] == 27 and key[1] == '[') {
+            switch (key[2]) {
+                'A' => {
+                    if (scroll > 0) scroll -= 1;
+                },
+                'B' => scroll += 1,
+                '5' => scroll -|= view_h,
+                '6' => scroll +|= view_h,
                 else => {},
             }
         }
