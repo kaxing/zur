@@ -1,8 +1,5 @@
-// TCP traceroute — no root needed, passes firewalls (SYN on 80/443)
-//
-// For each hop: create TCP socket with low TTL, connect() non-blocking.
-// Intermediate routers reply with ICMP Time Exceeded (captured via IP_RECVERR).
-// Destination replies with SYN-ACK (connect succeeds) or RST.
+// TCP SYN traceroute — no root needed, passes most firewalls.
+// Falls back to system `traceroute` on non-Linux.
 
 const std = @import("std");
 const posix = std.posix;
@@ -13,7 +10,6 @@ const linux = if (native_os == .linux) std.os.linux else undefined;
 pub const Backend = enum { tcp_syn, system };
 pub const backend: Backend = if (native_os == .linux) .tcp_syn else .system;
 
-// Linux socket options not in std
 const IP_TTL: u32 = 2;
 const IP_RECVERR: u32 = 11;
 const SOL_IP: i32 = 0;
@@ -43,7 +39,7 @@ pub const Hop = struct {
     ttl: u8,
     addr_buf: [46]u8 = .{0} ** 46,
     addr_len: u8 = 0,
-    rtt_us: i64 = -1, // -1 = no reply
+    rtt_us: i64 = -1,
     reached: bool = false,
 
     pub fn addr(self: *const Hop) ?[]const u8 {
@@ -55,8 +51,8 @@ pub const Hop = struct {
 pub const Tracer = if (native_os == .linux) LinuxTracer else SystemTracer;
 
 const LinuxTracer = struct {
-    dest_addr: u32, // network byte order IPv4
-    port: u16, // network byte order
+    dest_addr: u32,
+    port: u16,
 
     pub fn init(ip_str: []const u8, port: u16) !Tracer {
         const address = std.net.Address.resolveIp(ip_str, port) catch return error.InvalidAddress;
@@ -69,7 +65,6 @@ const LinuxTracer = struct {
     pub fn probe(self: *const Tracer, ttl: u8, timeout_ms: i32) Hop {
         var result = Hop{ .ttl = ttl };
 
-        // New socket per hop (TCP connect changes socket state)
         const sock = posix.socket(
             posix.AF.INET,
             posix.SOCK.STREAM | posix.SOCK.NONBLOCK,
@@ -77,19 +72,16 @@ const LinuxTracer = struct {
         ) catch return result;
         defer posix.close(sock);
 
-        // Set TTL
         const ttl_val: c_int = @intCast(ttl);
         posix.setsockopt(sock, SOL_IP, IP_TTL, std.mem.asBytes(&ttl_val)) catch return result;
 
-        // Enable ICMP error reporting on error queue
         const one: c_int = 1;
         posix.setsockopt(sock, SOL_IP, IP_RECVERR, std.mem.asBytes(&one)) catch return result;
 
-        // SO_LINGER with 0 timeout → RST on close (clean teardown)
+        // RST on close instead of TIME_WAIT
         const linger = Linger{ .l_onoff = 1, .l_linger = 0 };
         posix.setsockopt(sock, SOL_SOCKET, SO_LINGER, std.mem.asBytes(&linger)) catch {};
 
-        // Build destination
         var dest: linux.sockaddr.in = .{
             .family = posix.AF.INET,
             .port = self.port,
@@ -97,30 +89,26 @@ const LinuxTracer = struct {
             .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
         };
 
-        // Non-blocking connect — sends SYN
         const start = std.time.microTimestamp();
         posix.connect(sock, @ptrCast(&dest), @sizeOf(linux.sockaddr.in)) catch |err| {
             if (err != error.WouldBlock) return result;
         };
 
-        // Poll: POLLOUT = connected (destination), POLLERR = ICMP error (intermediate hop)
+        // POLLOUT = destination reached, POLLERR = ICMP error (intermediate hop)
         var pfd = [1]linux.pollfd{.{
             .fd = sock,
             .events = @as(i16, linux.POLL.OUT | linux.POLL.ERR),
             .revents = 0,
         }};
         const poll_rc = linux.poll(&pfd, 1, timeout_ms);
-        if (@as(isize, @bitCast(poll_rc)) <= 0) return result; // timeout or error
+        if (@as(isize, @bitCast(poll_rc)) <= 0) return result;
 
         result.rtt_us = std.time.microTimestamp() - start;
 
         if (pfd[0].revents & linux.POLL.ERR != 0) {
-            // ICMP error — read from error queue
             self.readErrorQueue(sock, &result);
         } else if (pfd[0].revents & linux.POLL.OUT != 0) {
-            // Connection established or refused — we reached the destination
             result.reached = true;
-            // Get destination IP
             const ip_bytes: [4]u8 = @bitCast(self.dest_addr);
             const formatted = std.fmt.bufPrint(&result.addr_buf, "{d}.{d}.{d}.{d}", .{
                 ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
@@ -131,6 +119,7 @@ const LinuxTracer = struct {
         return result;
     }
 
+    /// Extract ICMP sender IP from the socket error queue (MSG_ERRQUEUE)
     fn readErrorQueue(self: *const Tracer, sock: posix.fd_t, result: *Hop) void {
         _ = self;
         var msg_buf: [512]u8 = undefined;
@@ -156,11 +145,10 @@ const LinuxTracer = struct {
         const signed: isize = @bitCast(rc);
         if (signed < 0) return;
 
-        // Walk control messages — copy fields to avoid alignment traps
+        // Walk cmsg headers — copy fields individually to avoid alignment traps
         const ctrl_bytes: [*]const u8 = @ptrCast(&ctrl_buf);
         var offset: usize = 0;
         while (offset + @sizeOf(CmsgHdr) <= msg.controllen) {
-            // Read cmsg header fields via memcpy to avoid alignment issues
             var cmsg_len: usize = 0;
             var cmsg_level: i32 = 0;
             var cmsg_type: u32 = 0;
@@ -173,16 +161,13 @@ const LinuxTracer = struct {
             if (cmsg_level == SOL_IP and cmsg_type == IP_RECVERR) {
                 const data_start = offset + cmsgAlign(@sizeOf(CmsgHdr));
                 if (data_start + @sizeOf(SockExtendedErr) + @sizeOf(linux.sockaddr.in) <= msg.controllen) {
-                    // Copy SockExtendedErr
                     var see: SockExtendedErr = undefined;
                     @memcpy(std.mem.asBytes(&see), ctrl_bytes[data_start..][0..@sizeOf(SockExtendedErr)]);
 
-                    // Copy offender sockaddr
                     var offender: linux.sockaddr.in = undefined;
                     const off_start = data_start + @sizeOf(SockExtendedErr);
                     @memcpy(std.mem.asBytes(&offender), ctrl_bytes[off_start..][0..@sizeOf(linux.sockaddr.in)]);
 
-                    // Format hop IP
                     const ip_bytes: [4]u8 = @bitCast(offender.addr);
                     const formatted = std.fmt.bufPrint(&result.addr_buf, "{d}.{d}.{d}.{d}", .{
                         ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
@@ -201,7 +186,6 @@ const LinuxTracer = struct {
     }
 };
 
-// cmsghdr for Linux (not always in std)
 const CmsgHdr = extern struct {
     len: usize,
     level: i32,
@@ -212,7 +196,6 @@ fn cmsgAlign(len: usize) usize {
     return (len + @sizeOf(usize) - 1) & ~(@as(usize, @sizeOf(usize) - 1));
 }
 
-// ── Format helper ────────────────────────────────────────────────────
 pub fn fmtHop(buf: []u8, hop: Hop) []const u8 {
     if (hop.addr()) |ip| {
         if (hop.rtt_us >= 0) {
@@ -228,7 +211,6 @@ pub fn fmtHop(buf: []u8, hop: Hop) []const u8 {
     return std.fmt.bufPrint(buf, "{d:>2}: *", .{hop.ttl}) catch "?";
 }
 
-// ── System traceroute fallback (macOS / other) ──────────────────────
 const SystemTracer = struct {
     ip_str: []const u8,
 
@@ -237,7 +219,6 @@ const SystemTracer = struct {
         return .{ .ip_str = ip_str };
     }
 
-    // Stub — system backend uses runSystemTrace() in main instead
     pub fn probe(_: *const SystemTracer, _: u8, _: i32) Hop {
         return Hop{ .ttl = 0 };
     }

@@ -5,7 +5,6 @@ const traceroute = @import("traceroute.zig");
 
 const Curl = curl.libcurl;
 
-// ── ANSI ──────────────────────────────────────────────────────────────
 const esc = struct {
     const clear = "\x1b[2J\x1b[H";
     const hide_cursor = "\x1b[?25l";
@@ -31,7 +30,6 @@ fn colorForStatus(code: u32) []const u8 {
     };
 }
 
-// ── Formatting helpers ────────────────────────────────────────────────
 const FmtVal = struct { val: f64, unit: []const u8 };
 
 fn fmtBytes(bytes: f64) FmtVal {
@@ -51,7 +49,6 @@ fn fmtTimeBuf(buf: []u8, secs: f64) []const u8 {
     return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ t.val, t.unit }) catch "?";
 }
 
-// ── Curl info helpers ─────────────────────────────────────────────────
 fn getDouble(handle: *Curl.CURL, info: Curl.CURLINFO) ?f64 {
     var val: f64 = 0;
     if (Curl.curl_easy_getinfo(handle, info, &val) == Curl.CURLE_OK) return val;
@@ -72,7 +69,7 @@ fn getStr(handle: *Curl.CURL, info: Curl.CURLINFO) ?[]const u8 {
     return null;
 }
 
-const max_body_store = 256 * 1024; // 256KB cap
+const max_body_store = 256 * 1024;
 
 const BodyAccum = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -109,7 +106,6 @@ fn bodyWriteCallback(ptr: [*c]c_char, size: c_uint, nmemb: c_uint, user_data: *a
     return total;
 }
 
-// ── Cert info extraction ─────────────────────────────────────────────
 fn extractCertField(slist: [*c]Curl.struct_curl_slist, prefix: []const u8) ?[]const u8 {
     var node = slist;
     while (node != null) : (node = node.*.next) {
@@ -123,7 +119,6 @@ fn extractCertField(slist: [*c]Curl.struct_curl_slist, prefix: []const u8) ?[]co
     return null;
 }
 
-// ── Stats tracker ────────────────────────────────────────────────────
 const Sampler = struct {
     count: u32 = 0,
     sum: f64 = 0,
@@ -153,7 +148,6 @@ const Stats = struct {
     download: Sampler = .{},
 };
 
-// ── Traceroute state (background thread) ─────────────────────────────
 const TraceState = struct {
     mutex: std.Thread.Mutex = .{},
     output: std.ArrayListUnmanaged(u8) = .empty,
@@ -198,7 +192,7 @@ fn traceWithTcpSyn(state: *TraceState, ip_str: [:0]const u8, port: u16) void {
     var hop_buf: [128]u8 = undefined;
     var ttl: u8 = 1;
     while (ttl <= max_hops) : (ttl += 1) {
-        const hop = tracer.probe(ttl, 2000); // 2s timeout per hop
+        const hop = tracer.probe(ttl, 2000);
         const line = traceroute.fmtHop(&hop_buf, hop);
 
         state.mutex.lock();
@@ -229,7 +223,6 @@ fn traceWithSystem(state: *TraceState, ip_str: [:0]const u8) void {
         return;
     };
 
-    // Stream stdout line by line for live updates
     const stdout = child.stdout.?;
     var line_buf: [256]u8 = undefined;
     while (true) {
@@ -248,7 +241,6 @@ fn traceWithSystem(state: *TraceState, ip_str: [:0]const u8) void {
     state.mutex.unlock();
 }
 
-// ── Format buffers ───────────────────────────────────────────────────
 const FmtBufs = struct {
     status: [64]u8 = undefined,
     size: [32]u8 = undefined,
@@ -259,7 +251,6 @@ const FmtBufs = struct {
     ttfb: [64]u8 = undefined,
     dl: [64]u8 = undefined,
     total: [64]u8 = undefined,
-    // Per-phase stats detail buffers
     dns_st: [128]u8 = undefined,
     conn_st: [128]u8 = undefined,
     tls_st: [128]u8 = undefined,
@@ -271,13 +262,12 @@ const FmtBufs = struct {
     trace_val: [64]u8 = undefined,
 };
 
-// ── Row ──────────────────────────────────────────────────────────────
 const Row = struct {
     label: []const u8,
     value: []const u8,
     detail: ?[]const u8 = null,
-    body_ref: ?*const BodyAccum = null, // for Body row: full content
-    trace_ref: ?*TraceState = null, // for Traceroute row
+    body_ref: ?*const BodyAccum = null,
+    trace_ref: ?*TraceState = null,
     bar_frac: ?f64 = null,
     follow_url: ?[:0]const u8 = null,
 };
@@ -289,7 +279,6 @@ fn getTermSize() struct { rows: u16, cols: u16 } {
     return .{ .rows = 24, .cols = 80 };
 }
 
-// ── Terminal raw mode ─────────────────────────────────────────────────
 const RawTerm = struct {
     orig: posix.termios,
 
@@ -300,7 +289,7 @@ const RawTerm = struct {
         t.lflag.ICANON = false;
         t.lflag.ISIG = false;
         t.cc[@intFromEnum(posix.V.MIN)] = 0;
-        t.cc[@intFromEnum(posix.V.TIME)] = 2; // 200ms timeout for live updates
+        t.cc[@intFromEnum(posix.V.TIME)] = 2;
         try posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, t);
         return .{ .orig = orig };
     }
@@ -310,7 +299,6 @@ const RawTerm = struct {
     }
 };
 
-// ── Usage ─────────────────────────────────────────────────────────────
 const usage =
     \\zur — quick check on an HTTP endpoint
     \\
@@ -329,7 +317,6 @@ const usage =
     \\
 ;
 
-// ── Main ──────────────────────────────────────────────────────────────
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -340,7 +327,6 @@ pub fn main() !void {
     var ew = stderr_file.writer(&err_buf);
     const err_ = &ew.interface;
 
-    // Parse args
     var url_arg: ?[:0]const u8 = null;
     var method_arg: ?[]const u8 = null;
     var body_arg: ?[]const u8 = null;
@@ -397,7 +383,6 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Init curl
     const ca_bundle = curl.allocCABundle(allocator) catch null;
     defer if (ca_bundle) |cab| cab.deinit();
 
@@ -445,7 +430,6 @@ pub fn main() !void {
     var fetch_opts: curl.Easy.FetchOptions = .{ .method = m, .body = body_arg };
     if (header_list.items.len > 0) fetch_opts.headers = header_list.items;
 
-    // ── Stats across retries ──────────────────────────────────────────
     var stats: Stats = .{};
 
     var bufs: FmtBufs = undefined;
@@ -458,12 +442,10 @@ pub fn main() !void {
         rows.deinit(allocator);
     }
 
-    // Current state
     var status: u32 = 0;
     var failed = false;
     var content_type_str: []const u8 = "";
 
-    // ── Fetch + build rows (called on first run and each retry) ───────
     const doFetch = struct {
         fn run(
             e: *curl.Easy,
@@ -476,7 +458,6 @@ pub fn main() !void {
             alloc: std.mem.Allocator,
             b: *FmtBufs,
         ) !struct { status: u32, failed: bool } {
-            // Free old follow_urls
             for (rw.items) |row| {
                 if (row.follow_url) |furl| alloc.free(furl);
             }
@@ -486,8 +467,7 @@ pub fn main() !void {
 
             const resp = e.fetch(turl, fopts) catch {
                 st.runs += 1;
-                // Build error rows so TUI can display the failure
-                try rw.append(alloc, .{
+                    try rw.append(alloc, .{
                     .label = "Status",
                     .value = "✗ FAILED",
                     .detail = if (e.diagnostics.getMessage()) |msg| msg else "Connection failed",
@@ -505,7 +485,6 @@ pub fn main() !void {
             const stat: u32 = @intCast(resp.status_code);
             st.runs += 1;
 
-            // Timing
             const dns_time = getDouble(h, Curl.CURLINFO_NAMELOOKUP_TIME) orelse 0;
             const connect_time = getDouble(h, Curl.CURLINFO_CONNECT_TIME) orelse 0;
             const tls_time = getDouble(h, Curl.CURLINFO_APPCONNECT_TIME) orelse 0;
@@ -519,7 +498,6 @@ pub fn main() !void {
             const scheme = getStr(h, Curl.CURLINFO_SCHEME);
             const ssl_verify: ?c_long = getLong(h, Curl.CURLINFO_SSL_VERIFYRESULT);
 
-            // Update stats
             st.total.add(total_time);
             if (dns_time > 0.0001) st.dns.add(dns_time);
             const conn_dt = if (connect_time > dns_time + 0.0001) connect_time - dns_time else 0;
@@ -532,7 +510,6 @@ pub fn main() !void {
             const dl_dt = if (total_time > start_transfer + 0.0001) total_time - start_transfer else 0;
             if (dl_dt > 0.0001) st.download.add(dl_dt);
 
-            // Cert info
             var cert_subject: ?[]const u8 = null;
             var cert_issuer: ?[]const u8 = null;
             var cert_expire: ?[]const u8 = null;
@@ -554,7 +531,6 @@ pub fn main() !void {
             const total_ms = total_time * 1000;
             const has_stats = st.runs > 1;
 
-            // ── Build rows ───────────────────────────────────────────
             const status_str = std.fmt.bufPrint(&b.status, "{d}", .{stat}) catch "???";
             try rw.append(alloc, .{
                 .label = "Status",
@@ -575,7 +551,6 @@ pub fn main() !void {
                 try rw.append(alloc, .{ .label = "Size", .value = size_str });
             }
 
-            // Body row — show size, Enter opens full-screen viewer
             if (bacc.body().len > 0) {
                 const sz = fmtBytes(@floatFromInt(bacc.total));
                 const truncated = bacc.total > max_body_store;
@@ -603,7 +578,6 @@ pub fn main() !void {
                 }
             }
 
-            // TLS / cert
             if (is_https) {
                 const verify_ok = if (ssl_verify) |v| v == 0 else false;
                 try rw.append(alloc, .{
@@ -617,10 +591,8 @@ pub fn main() !void {
                 try rw.append(alloc, .{ .label = "TLS", .value = "✗ plain HTTP (no SSL)" });
             }
 
-            // Separator
             try rw.append(alloc, .{ .label = "─────────", .value = "──────────────────" });
 
-            // Timing rows — each phase has its own value + stats buffer
             if (dns_time > 0.0001) {
                 try rw.append(alloc, .{
                     .label = "DNS",
@@ -662,7 +634,6 @@ pub fn main() !void {
                 });
             }
 
-            // Total row
             try rw.append(alloc, .{
                 .label = "Total",
                 .value = fmtTimeBuf(&b.total, total_time),
@@ -673,7 +644,6 @@ pub fn main() !void {
         }
     }.run;
 
-    // ── Initial fetch ─────────────────────────────────────────────────
     const result = try doFetch(
         &easy, handle, target_url, fetch_opts, &body_acc, &stats, &rows, allocator, &bufs,
     );
@@ -691,16 +661,13 @@ pub fn main() !void {
 
     if (quiet) std.process.exit(if (status >= 200 and status < 400) 0 else 1);
 
-    // ── Spawn background traceroute ──────────────────────────────────
     var trace_state = TraceState.init(allocator);
     defer trace_state.deinit();
 
-    // Use resolved IP from curl (avoids DNS in traceroute)
     const trace_ip = getStr(handle, Curl.CURLINFO_PRIMARY_IP);
     const trace_ip_z: ?[:0]const u8 = if (trace_ip) |ip| allocator.dupeZ(u8, ip) catch null else null;
     defer if (trace_ip_z) |z| allocator.free(z);
 
-    // Port from URL scheme
     const trace_port: u16 = if (std.mem.startsWith(u8, target_url, "https")) 443 else 80;
 
     var trace_thread: ?std.Thread = null;
@@ -709,11 +676,9 @@ pub fn main() !void {
     }
     defer if (trace_thread) |t| t.join();
 
-    // Append trace row
     const trace_label = if (traceroute.backend == .tcp_syn) "Traceroute" else "Traceroute*";
     try rows.append(allocator, .{ .label = trace_label, .value = "starting\xe2\x80\xa6", .trace_ref = &trace_state });
 
-    // ── Non-interactive output ────────────────────────────────────────
     const is_tty = posix.isatty(posix.STDOUT_FILENO) and posix.isatty(posix.STDIN_FILENO);
 
     if (!is_tty) {
@@ -728,7 +693,6 @@ pub fn main() !void {
         return;
     }
 
-    // ── TUI loop ──────────────────────────────────────────────────────
     const raw = RawTerm.enter() catch {
         const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
         var ob: [8192]u8 = undefined;
@@ -751,7 +715,6 @@ pub fn main() !void {
     var show_detail = false;
 
     while (true) {
-        // Update trace row value
         for (rows.items) |*row| {
             if (row.trace_ref) |ts| {
                 const td = ts.getData();
@@ -764,10 +727,7 @@ pub fn main() !void {
             }
         }
 
-        // Clear and draw
         try out.writeAll(esc.hide_cursor ++ esc.clear);
-
-        // Header
         try out.writeAll(esc.bold ++ " zur" ++ esc.reset ++ "  ");
         if (failed) {
             try out.writeAll(esc.red ++ "FAIL" ++ esc.reset);
@@ -781,13 +741,11 @@ pub fn main() !void {
         try out.writeAll(target_url);
         try out.writeAll(esc.reset);
 
-        // Retry counter in header
         if (stats.runs > 1) {
             try out.writeAll("  ");
             try out.writeAll(esc.cyan);
             try out.print("#{d}", .{stats.runs});
             try out.writeAll(esc.reset);
-            // Compact avg total
             try out.writeAll(esc.dim);
             const avg_t = fmtTime(stats.total.avg());
             try out.print("  avg {d:.0}{s}", .{ avg_t.val, avg_t.unit });
@@ -797,7 +755,6 @@ pub fn main() !void {
         try out.writeByte('\n');
         try out.writeAll(esc.dim ++ " ─────────────────────────────────────────────" ++ esc.reset ++ "\n");
 
-        // Rows
         for (rows.items, 0..) |row, idx| {
             const selected = idx == cursor;
 
@@ -821,7 +778,6 @@ pub fn main() !void {
             if (selected) try out.writeAll(esc.reset);
             try out.writeByte('\n');
 
-            // Detail panel (expanded) — not for body (body uses full-screen)
             if (selected and show_detail and row.body_ref == null) {
                 if (row.detail) |detail| {
                     try out.writeAll(esc.dim ++ "   ↳ " ++ esc.reset);
@@ -831,15 +787,13 @@ pub fn main() !void {
             }
         }
 
-        // Footer
         try out.writeAll("\n" ++ esc.dim ++ " ↑↓ navigate  ⏎ details  r retry  q quit" ++ esc.reset);
 
         try out.flush();
 
-        // Read key
         var read_buf: [8]u8 = undefined;
         const n = posix.read(posix.STDIN_FILENO, &read_buf) catch break;
-        if (n == 0) continue; // timeout — redraw for live trace updates
+        if (n == 0) continue;
 
         const key = read_buf[0..n];
         if (key.len == 1) {
@@ -854,7 +808,6 @@ pub fn main() !void {
                     show_detail = false;
                 },
                 '\r', '\n' => {
-                    // Follow redirect URL
                     if (rows.items[cursor].follow_url) |furl| {
                         raw.leave();
                         try out.writeAll(esc.show_cursor);
@@ -869,12 +822,10 @@ pub fn main() !void {
                         std.process.execve(allocator, new_args.items, null) catch {};
                         break;
                     }
-                    // Full-screen body viewer
                     if (rows.items[cursor].body_ref) |bref| {
                         try bodyViewer(out, bref, target_url, content_type_str);
                         continue; // redraw overview
                     }
-                    // Full-screen trace viewer
                     if (rows.items[cursor].trace_ref) |tref| {
                         try traceViewer(out, tref, target_url);
                         continue;
@@ -882,17 +833,14 @@ pub fn main() !void {
                     show_detail = !show_detail;
                 },
                 'r', 'R' => {
-                    // In-process retry: re-fetch and rebuild rows
                     const r = doFetch(
                         &easy, handle, target_url, fetch_opts, &body_acc, &stats, &rows, allocator, &bufs,
                     ) catch continue;
                     status = r.status;
                     failed = r.failed;
                     content_type_str = getStr(handle, Curl.CURLINFO_CONTENT_TYPE) orelse "";
-                    // Re-append trace row (doFetch clears rows)
                     rows.append(allocator, .{ .label = trace_label, .value = "…", .trace_ref = &trace_state }) catch {};
                     show_detail = false;
-                    // Keep cursor in bounds
                     if (cursor >= rows.items.len and rows.items.len > 0) cursor = rows.items.len - 1;
                 },
                 else => {},
@@ -920,7 +868,6 @@ fn bodyViewer(out: *std.Io.Writer, bref: *const BodyAccum, url: []const u8, ctyp
     const body_data = bref.body();
     var scroll: usize = 0;
 
-    // Count total lines
     var total_lines: usize = 1;
     for (body_data) |ch| {
         if (ch == '\n') total_lines += 1;
@@ -933,7 +880,6 @@ fn bodyViewer(out: *std.Io.Writer, bref: *const BodyAccum, url: []const u8, ctyp
 
         try out.writeAll(esc.hide_cursor ++ esc.clear);
 
-        // Header
         try out.writeAll(esc.bold ++ " Body" ++ esc.reset ++ "  ");
         try out.writeAll(esc.dim);
         try out.writeAll(url);
@@ -943,13 +889,11 @@ fn bodyViewer(out: *std.Io.Writer, bref: *const BodyAccum, url: []const u8, ctyp
         }
         try out.writeAll(esc.reset ++ "\n");
 
-        // Separator
         try out.writeAll(esc.dim);
         var sep_i: usize = 0;
         while (sep_i < @min(view_w + 1, 60)) : (sep_i += 1) try out.writeAll("─");
         try out.writeAll(esc.reset ++ "\n");
 
-        // Body lines
         var line_start: usize = 0;
         var line_num: usize = 0;
         var displayed: usize = 0;
@@ -957,7 +901,6 @@ fn bodyViewer(out: *std.Io.Writer, bref: *const BodyAccum, url: []const u8, ctyp
             if (line_start == body_data.len) break;
             const nl = std.mem.indexOfScalarPos(u8, body_data, line_start, '\n') orelse body_data.len;
             if (line_num >= scroll) {
-                // Line number gutter
                 try out.writeAll(esc.dim);
                 try out.print("{d:>4}│" ++ esc.reset, .{line_num + 1});
                 const line_end = @min(nl, line_start + view_w -| 5);
@@ -969,7 +912,6 @@ fn bodyViewer(out: *std.Io.Writer, bref: *const BodyAccum, url: []const u8, ctyp
             line_num += 1;
         }
 
-        // Footer
         const sz = fmtBytes(@floatFromInt(bref.total));
         try out.writeAll(esc.dim);
         try out.print("\n {d}/{d} lines  {d:.1} {s}  ↑↓/j/k scroll  q/Esc back", .{
@@ -982,7 +924,6 @@ fn bodyViewer(out: *std.Io.Writer, bref: *const BodyAccum, url: []const u8, ctyp
 
         try out.flush();
 
-        // Key input
         var read_buf: [8]u8 = undefined;
         const n = posix.read(posix.STDIN_FILENO, &read_buf) catch return;
         if (n == 0) return;
@@ -1012,7 +953,6 @@ fn bodyViewer(out: *std.Io.Writer, bref: *const BodyAccum, url: []const u8, ctyp
             }
         }
 
-        // Clamp scroll
         if (total_lines > view_h) {
             if (scroll > total_lines - view_h) scroll = total_lines - view_h;
         } else {
@@ -1034,7 +974,6 @@ fn traceViewer(out: *std.Io.Writer, ts: *TraceState, url: []const u8) !void {
 
         try out.writeAll(esc.hide_cursor ++ esc.clear);
 
-        // Header
         try out.writeAll(esc.bold ++ " Traceroute" ++ esc.reset ++
             if (traceroute.backend == .tcp_syn) esc.dim ++ " (tcp-syn)" ++ esc.reset ++ "  " else esc.dim ++ " (system)" ++ esc.reset ++ "  ");
         try out.writeAll(esc.dim);
@@ -1044,13 +983,11 @@ fn traceViewer(out: *std.Io.Writer, ts: *TraceState, url: []const u8) !void {
         }
         try out.writeAll(esc.reset ++ "\n");
 
-        // Separator
         try out.writeAll(esc.dim);
         var sep_i: usize = 0;
         while (sep_i < @min(view_w + 1, 60)) : (sep_i += 1) try out.writeAll("\xe2\x94\x80");
         try out.writeAll(esc.reset ++ "\n");
 
-        // Trace lines
         if (trace_data.len == 0) {
             if (td.failed) {
                 try out.writeAll(esc.red ++ " traceroute failed — could not create socket" ++ esc.reset ++ "\n");
@@ -1076,7 +1013,6 @@ fn traceViewer(out: *std.Io.Writer, ts: *TraceState, url: []const u8) !void {
             }
         }
 
-        // Footer
         try out.writeAll(esc.dim);
         try out.print("\n {d} hops  ", .{total_lines});
         if (td.done) try out.writeAll("complete  ") else try out.writeAll("in progress  ");
@@ -1085,7 +1021,6 @@ fn traceViewer(out: *std.Io.Writer, ts: *TraceState, url: []const u8) !void {
 
         try out.flush();
 
-        // Key input
         var read_buf: [8]u8 = undefined;
         const n = posix.read(posix.STDIN_FILENO, &read_buf) catch return;
         if (n == 0) continue; // timeout — refresh for live updates
@@ -1115,7 +1050,6 @@ fn traceViewer(out: *std.Io.Writer, ts: *TraceState, url: []const u8) !void {
             }
         }
 
-        // Clamp scroll
         if (total_lines > view_h) {
             if (scroll > total_lines - view_h) scroll = total_lines - view_h;
         } else {
