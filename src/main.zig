@@ -212,8 +212,8 @@ fn traceWithTcpSyn(state: *TraceState, ip_str: [:0]const u8, port: u16) void {
 fn traceWithSystem(state: *TraceState, ip_str: [:0]const u8) void {
     const argv = [_][]const u8{ "traceroute", "-m", "30", "-w", "2", ip_str };
     var child = std.process.Child.init(&argv, state.alloc);
-    child.stdout_behavior = .pipe;
-    child.stderr_behavior = .pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
 
     child.spawn() catch {
         state.mutex.lock();
@@ -224,9 +224,19 @@ fn traceWithSystem(state: *TraceState, ip_str: [:0]const u8) void {
     };
 
     const stdout = child.stdout.?;
-    var line_buf: [256]u8 = undefined;
-    while (true) {
-        const line = stdout.reader().readUntilDelimiter(&line_buf, '\n') catch break;
+    const out = stdout.readToEndAlloc(state.alloc, 1024 * 1024) catch {
+        _ = child.wait() catch {};
+        state.mutex.lock();
+        state.failed = true;
+        state.done = true;
+        state.mutex.unlock();
+        return;
+    };
+    defer state.alloc.free(out);
+
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
         state.mutex.lock();
         state.output.appendSlice(state.alloc, line) catch {};
         state.output.append(state.alloc, '\n') catch {};
