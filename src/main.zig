@@ -936,7 +936,7 @@ fn bodyViewer(out: *std.Io.Writer, bref: *const BodyAccum, url: []const u8, ctyp
 
         var read_buf: [8]u8 = undefined;
         const n = posix.read(posix.STDIN_FILENO, &read_buf) catch return;
-        if (n == 0) return;
+        if (n == 0) continue;
 
         const key = read_buf[0..n];
         if (key.len == 1) {
