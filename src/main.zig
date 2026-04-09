@@ -1,6 +1,7 @@
 const std = @import("std");
 const curl = @import("curl");
 const posix = std.posix;
+const builtin = @import("builtin");
 const traceroute = @import("traceroute.zig");
 
 const Curl = curl.libcurl;
@@ -175,7 +176,7 @@ fn traceThreadFn(state: *TraceState, ip_str: [:0]const u8, port: u16) void {
     if (traceroute.backend == .tcp_syn) {
         traceWithTcpSyn(state, ip_str, port);
     } else {
-        traceWithSystem(state, ip_str);
+        traceWithSystem(state, ip_str, port);
     }
 }
 
@@ -209,18 +210,36 @@ fn traceWithTcpSyn(state: *TraceState, ip_str: [:0]const u8, port: u16) void {
     state.mutex.unlock();
 }
 
-fn traceWithSystem(state: *TraceState, ip_str: [:0]const u8) void {
-    const argv = [_][]const u8{ "traceroute", "-m", "30", "-w", "2", ip_str };
-    var child = std.process.Child.init(&argv, state.alloc);
+fn traceWithSystem(state: *TraceState, ip_str: [:0]const u8, port: u16) void {
+    _ = port;
+
+    const argv_default = [_][]const u8{ "traceroute", "-m", "30", "-w", "2", ip_str };
+    const argv_macos_abs = [_][]const u8{ "/usr/sbin/traceroute", "-m", "30", "-w", "2", ip_str };
+    const argv_macos_fallback = [_][]const u8{ "traceroute", "-m", "30", "-w", "2", ip_str };
+
+    var child = std.process.Child.init(if (builtin.os.tag == .macos) &argv_macos_abs else &argv_default, state.alloc);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
-    child.spawn() catch {
-        state.mutex.lock();
-        state.failed = true;
-        state.done = true;
-        state.mutex.unlock();
-        return;
+    child.spawn() catch |err| {
+        if (builtin.os.tag == .macos and err == error.FileNotFound) {
+            child = std.process.Child.init(&argv_macos_fallback, state.alloc);
+            child.stdout_behavior = .Pipe;
+            child.stderr_behavior = .Pipe;
+            child.spawn() catch {
+                state.mutex.lock();
+                state.failed = true;
+                state.done = true;
+                state.mutex.unlock();
+                return;
+            };
+        } else {
+            state.mutex.lock();
+            state.failed = true;
+            state.done = true;
+            state.mutex.unlock();
+            return;
+        }
     };
 
     const stdout = child.stdout.?;
@@ -282,10 +301,16 @@ const Row = struct {
     follow_url: ?[:0]const u8 = null,
 };
 
+const section_divider_width: usize = 45;
+
+fn rowAllowsEnter(row: Row) bool {
+    return row.detail != null or row.body_ref != null or row.trace_ref != null or row.follow_url != null;
+}
+
 fn getTermSize() struct { rows: u16, cols: u16 } {
     var ws: posix.winsize = undefined;
-    const rc = std.os.linux.ioctl(posix.STDOUT_FILENO, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws));
-    if (rc == 0) return .{ .rows = ws.row, .cols = ws.col };
+    const rc = posix.system.ioctl(posix.STDOUT_FILENO, posix.T.IOCGWINSZ, @intFromPtr(&ws));
+    if (posix.errno(rc) == .SUCCESS) return .{ .rows = ws.row, .cols = ws.col };
     return .{ .rows = 24, .cols = 80 };
 }
 
@@ -323,7 +348,7 @@ const usage =
     \\  -q              Quiet mode (exit code only)
     \\  -h, --help      Show this help
     \\
-    \\TUI: ↑/↓ navigate  ⏎ details  r retry  q quit
+    \\TUI: ↑/↓ navigate  ⏎ details  r retry  q/Esc quit
     \\
 ;
 
@@ -542,10 +567,52 @@ pub fn main() !void {
             const has_stats = st.runs > 1;
 
             const status_str = std.fmt.bufPrint(&b.status, "{d}", .{stat}) catch "???";
+            const status_summary: ?[]const u8 = if (stat == 200)
+                "OK"
+            else if (stat == 201)
+                "Created"
+            else if (stat == 204)
+                "No Content"
+            else if (stat == 301)
+                "Moved Permanently"
+            else if (stat == 302)
+                "Found"
+            else if (stat == 304)
+                "Not Modified"
+            else if (stat == 400)
+                "Bad Request"
+            else if (stat == 401)
+                "Unauthorized"
+            else if (stat == 403)
+                "Forbidden"
+            else if (stat == 404)
+                "Not Found"
+            else if (stat == 408)
+                "Timeout"
+            else if (stat == 429)
+                "Rate Limited"
+            else if (stat == 500)
+                "Server Error"
+            else if (stat == 502)
+                "Bad Gateway"
+            else if (stat == 503)
+                "Unavailable"
+            else if (stat >= 200 and stat < 300)
+                "Success"
+            else if (stat >= 300 and stat < 400)
+                "Redirect"
+            else if (stat >= 400 and stat < 500)
+                "Client Error"
+            else if (stat >= 500)
+                "Server Error"
+            else
+                null;
             try rw.append(alloc, .{
                 .label = "Status",
-                .value = status_str,
-                .detail = if (stat >= 200 and stat < 300) "OK" else if (stat >= 300 and stat < 400) "Redirect" else if (stat >= 400 and stat < 500) "Client Error" else if (stat >= 500) "Server Error" else null,
+                .value = if (status_summary) |summary|
+                    std.fmt.bufPrint(&b.status, "{d} → {s}", .{ stat, summary }) catch status_str
+                else
+                    status_str,
             });
 
             if (ip) |addr| try rw.append(alloc, .{ .label = "IP", .value = addr });
@@ -686,8 +753,14 @@ pub fn main() !void {
     }
     defer if (trace_thread) |t| t.join();
 
-    const trace_label = if (traceroute.backend == .tcp_syn) "Traceroute" else "Traceroute*";
-    try rows.append(allocator, .{ .label = trace_label, .value = "starting\xe2\x80\xa6", .trace_ref = &trace_state });
+    const trace_label = "Traceroute";
+    const trace_source = if (traceroute.backend == .tcp_syn)
+        "native tcp-syn"
+    else if (builtin.os.tag == .macos)
+        "/usr/sbin/traceroute"
+    else
+        "traceroute";
+    try rows.append(allocator, .{ .label = trace_label, .value = "starting\xe2\x80\xa6", .detail = trace_source, .trace_ref = &trace_state });
 
     const is_tty = posix.isatty(posix.STDOUT_FILENO) and posix.isatty(posix.STDIN_FILENO);
 
@@ -737,6 +810,9 @@ pub fn main() !void {
             }
         }
 
+        const term = getTermSize();
+        const divider_width: usize = @min(section_divider_width, @max(1, @as(usize, term.cols) -| 2));
+
         try out.writeAll(esc.hide_cursor ++ esc.clear);
         try out.writeAll(esc.bold ++ " zur" ++ esc.reset ++ "  ");
         if (failed) {
@@ -763,30 +839,50 @@ pub fn main() !void {
         }
 
         try out.writeByte('\n');
-        try out.writeAll(esc.dim ++ " ─────────────────────────────────────────────" ++ esc.reset ++ "\n");
+        try out.writeAll(esc.dim);
+        try out.writeAll(" ");
+        var header_divider_i: usize = 0;
+        while (header_divider_i < divider_width) : (header_divider_i += 1) try out.writeAll("─");
+        try out.writeAll(esc.reset ++ "\n");
 
         for (rows.items, 0..) |row, idx| {
             const selected = idx == cursor;
 
-            if (selected) try out.writeAll(esc.reverse);
-
-            try out.print(" {s:<14}", .{row.label});
-
-            if (row.bar_frac) |frac| {
-                try out.print(" {s:<10} ", .{row.value});
-                if (!selected) try out.writeAll(esc.cyan);
-                const bar_w: u16 = 20;
-                const filled: u16 = @intFromFloat(@min(@as(f64, @floatFromInt(bar_w)), frac * @as(f64, @floatFromInt(bar_w))));
-                for (0..filled) |_| try out.writeAll("█");
-                if (!selected) try out.writeAll(esc.dim);
-                for (0..bar_w - filled) |_| try out.writeAll("░");
-                if (!selected) try out.writeAll(esc.reset);
+            if (std.mem.eql(u8, row.label, "─────────")) {
+                if (selected) try out.writeAll(esc.reverse);
+                try out.writeAll(" ");
+                var divider_i: usize = 0;
+                while (divider_i < divider_width) : (divider_i += 1) try out.writeAll("─");
+                if (selected) try out.writeAll(esc.reset);
+                try out.writeByte('\n');
             } else {
-                try out.print(" {s}", .{row.value});
-            }
+                if (selected) try out.writeAll(esc.reverse);
 
-            if (selected) try out.writeAll(esc.reset);
-            try out.writeByte('\n');
+                try out.print(" {s:<14}", .{row.label});
+
+                if (row.bar_frac) |frac| {
+                    try out.print(" {s:<10} ", .{row.value});
+                    if (!selected) try out.writeAll(esc.cyan);
+                    const bar_w: u16 = 20;
+                    const filled: u16 = @intFromFloat(@min(@as(f64, @floatFromInt(bar_w)), frac * @as(f64, @floatFromInt(bar_w))));
+                    for (0..filled) |_| try out.writeAll("█");
+                    if (!selected) try out.writeAll(esc.dim);
+                    for (0..bar_w - filled) |_| try out.writeAll("░");
+                    if (!selected) try out.writeAll(esc.reset);
+                } else {
+                    try out.print(" {s}", .{row.value});
+                }
+
+                if (rowAllowsEnter(row) and std.mem.indexOf(u8, row.value, "⏎") == null) {
+                    try out.writeAll("  ");
+                    if (!selected) try out.writeAll(esc.dim);
+                    try out.writeAll("⏎");
+                    if (!selected) try out.writeAll(esc.reset);
+                }
+
+                if (selected) try out.writeAll(esc.reset);
+                try out.writeByte('\n');
+            }
 
             if (selected and show_detail and row.body_ref == null) {
                 if (row.detail) |detail| {
@@ -797,7 +893,7 @@ pub fn main() !void {
             }
         }
 
-        try out.writeAll("\n" ++ esc.dim ++ " ↑↓ navigate  ⏎ details  r retry  q quit" ++ esc.reset);
+        try out.writeAll("\n" ++ esc.dim ++ " ↑↓ navigate  ⏎ details  r retry  q/Esc quit" ++ esc.reset);
 
         try out.flush();
 
@@ -808,7 +904,12 @@ pub fn main() !void {
         const key = read_buf[0..n];
         if (key.len == 1) {
             switch (key[0]) {
-                'q', 27 => break,
+                'q', 27 => {
+                    raw.leave();
+                    try out.writeAll(esc.show_cursor ++ esc.clear);
+                    try out.flush();
+                    std.process.exit(0);
+                },
                 'j', 'J' => {
                     if (cursor + 1 < rows.items.len) cursor += 1;
                     show_detail = false;
@@ -985,7 +1086,12 @@ fn traceViewer(out: *std.Io.Writer, ts: *TraceState, url: []const u8) !void {
         try out.writeAll(esc.hide_cursor ++ esc.clear);
 
         try out.writeAll(esc.bold ++ " Traceroute" ++ esc.reset ++
-            if (traceroute.backend == .tcp_syn) esc.dim ++ " (tcp-syn)" ++ esc.reset ++ "  " else esc.dim ++ " (system)" ++ esc.reset ++ "  ");
+            if (traceroute.backend == .tcp_syn)
+                esc.dim ++ " [native tcp-syn]" ++ esc.reset ++ "  "
+            else if (builtin.os.tag == .macos)
+                esc.dim ++ " [/usr/sbin/traceroute]" ++ esc.reset ++ "  "
+            else
+                esc.dim ++ " [traceroute]" ++ esc.reset ++ "  ");
         try out.writeAll(esc.dim);
         try out.writeAll(url);
         if (!td.done) {
@@ -1026,6 +1132,12 @@ fn traceViewer(out: *std.Io.Writer, ts: *TraceState, url: []const u8) !void {
         try out.writeAll(esc.dim);
         try out.print("\n {d} hops  ", .{total_lines});
         if (td.done) try out.writeAll("complete  ") else try out.writeAll("in progress  ");
+        if (traceroute.backend == .tcp_syn)
+            try out.writeAll("native tcp-syn  ")
+        else if (builtin.os.tag == .macos)
+            try out.writeAll("/usr/sbin/traceroute  ")
+        else
+            try out.writeAll("traceroute  ");
         try out.writeAll("\xe2\x86\x91\xe2\x86\x93/j/k scroll  q/Esc back");
         try out.writeAll(esc.reset);
 
